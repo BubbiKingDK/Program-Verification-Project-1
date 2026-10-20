@@ -102,7 +102,11 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
 
             Ok(IVLCmd::seq(&first_ivl, &second_ivl))
         }
-        CmdKind::Assignment { name, expr } => Ok(IVLCmd::assign(name, expr)),
+        CmdKind::Assignment { name, expr } => {
+            let mut cmds = div_asserts(expr);
+            cmds.push(IVLCmd::assign(name, expr));
+            Ok(IVLCmd::seqs(&cmds))
+        }
         CmdKind::VarDefinition {
             name,
             ty,
@@ -177,10 +181,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
 
             for case in &body.cases {
                 let guard = &case.condition;
-                let mut b = vec![
-                    IVLCmd::assume(guard),
-                    cmd_to_ivlcmd(&case.cmd)?,
-                ];
+                let mut b = vec![IVLCmd::assume(guard), cmd_to_ivlcmd(&case.cmd)?];
 
                 for inv in invariants {
                     b.push(IVLCmd::assert(inv, "Loop invariant might not be preserved"))
@@ -191,7 +192,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 let neg = not(guard);
                 none_hold = Some(match none_hold {
                     Some(prev) => infix(&prev, Op::And, &neg, Type::Bool),
-                    None => neg, 
+                    None => neg,
                 });
             }
 
@@ -273,6 +274,27 @@ fn forall(name: &Name, ty: &Type, post: &Expr) -> Expr {
     result
 }
 */
+fn div_asserts(expr: &Expr) -> Vec<IVLCmd> {
+    let mut out = Vec::new();
+    match &expr.kind {
+        ExprKind::Infix(left, op, right) => {
+            out.extend(div_asserts(left));
+            out.extend(div_asserts(right));
+
+            match op {
+                Op::Div | Op::Mod => {
+                    let zero = Expr::num(0);
+                    let nonzero = infix(right, Op::Ne, &zero, Type::Bool);
+                    out.push(IVLCmd::assert(&nonzero, "Possible division or mod by zero"));
+                }
+                _ => {}
+            }
+        }
+        ExprKind::Prefix(_, inner) => out.extend(div_asserts(inner)),
+        _ => {}
+    }
+    return out;
+}
 
 fn not(expr: &Expr) -> Expr {
     let mut result = expr.clone();
