@@ -179,12 +179,15 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             let mut branches = Vec::new();
             let mut none_hold: Option<Expr> = None;
 
-            for case in &body.cases {
+            for (idx, case) in body.cases.iter().enumerate() {
                 let guard = &case.condition;
                 let mut b = vec![IVLCmd::assume(guard), cmd_to_ivlcmd(&case.cmd)?];
 
                 for inv in invariants {
-                    b.push(IVLCmd::assert(inv, "Loop invariant might not be preserved"))
+                    b.push(IVLCmd::assert(
+                        inv,
+                        &format!("Loop invariant might not be preserved in case {}", idx + 1),
+                    ));
                 }
                 b.push(IVLCmd::unreachable());
                 branches.push(IVLCmd::seqs(&b));
