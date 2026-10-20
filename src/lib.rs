@@ -10,6 +10,10 @@ use slang_ui::prelude::{
     *,
 };
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static FRESH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 pub struct App;
 
 struct VerificationCondition {
@@ -144,7 +148,78 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
 
             None => Ok(IVLCmd::assume(&Expr::bool(true))),
         },
+
+        CmdKind::Loop {
+            invariants,
+            variant,
+            body,
+        } => {
+            let mut modified = Vec::new();
+            let mut cmds = Vec::new();
+            for inv in invariants {
+                cmds.push(IVLCmd::assert(
+                    inv,
+                    "Loop invariant might not hold initially",
+                ))
+            }
+            for case in &body.cases {
+                collect_modified(&case.cmd, &mut modified);
+            }
+            for (name, ty) in &modified {
+                cmds.push(IVLCmd::havoc(name, ty));
+            }
+            for inv in invariants {
+                cmds.push(IVLCmd::assume(inv))
+            }
+
+            let mut branches = Vec::new();
+            let mut none_hold: Option<Expr> = None;
+
+            for case in &body.cases {
+                let guard = &case.condition;
+                let mut b = vec![
+                    IVLCmd::assume(guard),
+                    cmd_to_ivlcmd(&case.cmd)?,
+                ];
+
+                for inv in invariants {
+                    b.push(IVLCmd::assert(inv, "Loop invariant might not be preserved"))
+                }
+                b.push(IVLCmd::unreachable());
+                branches.push(IVLCmd::seqs(&b));
+
+                let neg = not(guard);
+                none_hold = Some(match none_hold {
+                    Some(prev) => infix(&prev, Op::And, &neg, Type::Bool),
+                    None => neg, 
+                });
+            }
+
+            branches.push(IVLCmd::assume(&none_hold.unwrap_or(Expr::bool(true))));
+            cmds.push(IVLCmd::nondets(&branches));
+            Ok(IVLCmd::seqs(&cmds))
+        }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
+    }
+}
+
+fn collect_modified(cmd: &Cmd, out: &mut Vec<(Name, Type)>) {
+    match &cmd.kind {
+        CmdKind::Assignment { name, expr } => {
+            if !out.iter().any(|(n, _)| n.ident == name.ident) {
+                out.push((name.clone(), expr.ty.clone()));
+            }
+        }
+        CmdKind::Seq(a, b) => {
+            collect_modified(a, out);
+            collect_modified(b, out);
+        }
+        CmdKind::Match { body } | CmdKind::Loop { body, .. } => {
+            for case in &body.cases {
+                collect_modified(&case.cmd, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -181,6 +256,7 @@ fn substitute(post: &Expr, name: &Name, value: &Expr) -> Expr {
     }
 }
 
+/*
 fn forall(name: &Name, ty: &Type, post: &Expr) -> Expr {
     let variable = Var {
         name: name.clone(),
@@ -196,12 +272,18 @@ fn forall(name: &Name, ty: &Type, post: &Expr) -> Expr {
 
     result
 }
+*/
 
 fn not(expr: &Expr) -> Expr {
     let mut result = expr.clone();
     result.kind = ExprKind::Prefix(PrefixOp::Not, Box::new(expr.clone()));
     result.ty = Type::Bool;
     result
+}
+
+fn fresh_ident(base: &str) -> String {
+    let n = FRESH_COUNTER.fetch_add(1, Ordering::SeqCst);
+    return format!("{base}_havoc_{n}");
 }
 
 /// Compute the weakest precondition of IVL program
@@ -257,8 +339,10 @@ fn wp(
 
         // wp[havoc x](G) = Forall x. G
         IVLCmdKind::Havoc { name, ty } => {
-            let pre = forall(name, ty, post);
-            Ok((pre, Vec::new()))
+            let mut fresh = Expr::bool(true);
+            fresh.kind = ExprKind::Ident(fresh_ident(&name.ident));
+            fresh.ty = ty.clone();
+            Ok((substitute(post, name, &fresh), Vec::new()))
         }
 
         // wp[C1 [] C2](G) = wp[C1](G) And wp[C2](G)
