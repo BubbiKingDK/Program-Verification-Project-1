@@ -7,6 +7,7 @@ use ivl::{IVLCmd, IVLCmdKind};
 use slang::ast::{Cmd, CmdKind, Expr, ExprKind, Name, Op, PrefixOp, Quantifier, Type, Var};
 use slang_ui::prelude::{
     slang::{ast::Op::Imp, Span},
+    smtlib::Bool,
     *,
 };
 
@@ -198,9 +199,137 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                     None => neg,
                 });
             }
-
             branches.push(IVLCmd::assume(&none_hold.unwrap_or(Expr::bool(true))));
             cmds.push(IVLCmd::nondets(&branches));
+            Ok(IVLCmd::seqs(&cmds))
+        }
+        CmdKind::For {
+            name,
+            range,
+            invariants,
+            variant: _,
+            body,
+        } => {
+            let slang::ast::Range::FromTo(lower_bound, upper_bound) = range;
+
+            // Bounded For-loops
+            if let (Some(start), Some(end)) = (
+                constant_int(lower_bound),
+                constant_int(upper_bound),
+            ) {
+                if invariants.is_empty() {
+                    return unroll_for(name, start, end, &body.cmd);
+                }
+            }
+
+            // Unbounded For-loops
+            let lower = fresh_name("lower");
+            let upper = fresh_name("upper");
+            let initial_lower = fresh_name("initial_lower");
+            
+            let lower_expr = name_to_expr(&lower, Type::Int);
+            let upper_expr = name_to_expr(&upper, Type::Int);
+            let initial_lower_expr = name_to_expr(&initial_lower, Type::Int);
+
+            let mut cmds = Vec::new();
+            
+            cmds.push(IVLCmd::assign(&lower, lower_bound));
+            cmds.push(IVLCmd::assign(&upper, upper_bound));
+            cmds.push(IVLCmd::assign(&initial_lower, &lower_expr));
+
+
+            let guard = infix(&lower_expr, Op::Lt, &upper_expr, Type::Bool);
+
+            let lower_bound_inv = infix(
+                &initial_lower_expr,
+                Op::Le,
+                &lower_expr,
+                Type::Bool,
+            );
+
+            let upper_bound_inv = infix(
+                &infix(
+                    &lower_expr,
+                    Op::Le,
+                    &initial_lower_expr,
+                    Type::Bool,
+                ),
+                Op::Or,
+                &infix(
+                    &lower_expr,
+                    Op::Le,
+                    &upper_expr,
+                    Type::Bool,
+                ),
+                Type::Bool,
+            );
+
+            let mut loop_invariants = vec![
+                lower_bound_inv,
+                upper_bound_inv,
+            ];
+
+            loop_invariants.extend(
+                invariants
+                    .iter()
+                    .map(|inv| substitute(inv, name, &lower_expr)),
+            );
+
+            for inv in &loop_invariants {
+                cmds.push(IVLCmd::assert(
+                    inv,
+                    "For-loop invariant might not hold initially",
+                ));
+            }
+
+            let mut modified = Vec::new();
+            collect_modified(&body.cmd, &mut modified);
+
+            for (modified_name, ty) in &modified {
+                cmds.push(IVLCmd::havoc(modified_name, ty));
+            }
+
+            cmds.push(IVLCmd::havoc(&lower, &Type::Int));
+
+            for inv in &loop_invariants {
+                cmds.push(IVLCmd::assume(inv));
+            }
+
+            let assign_i = IVLCmd::assign(name, &lower_expr);
+
+            let encoded_body = cmd_to_ivlcmd(&body.cmd)?;
+
+            let increment = infix(&lower_expr, Op::Add, &Expr::num(1), Type::Int);
+
+            let increment_lower = IVLCmd::assign(&lower, &increment);
+
+
+
+            let mut iteration_cmds = vec![
+                IVLCmd::assume(&guard),
+                assign_i,
+                encoded_body,
+                increment_lower,
+            ];
+
+            for inv in &loop_invariants {
+                iteration_cmds.push(IVLCmd::assert(
+                    inv,
+                    "For-loop invariant might not be preserved",
+                ));
+            }
+
+            iteration_cmds.push(IVLCmd::unreachable());
+
+            let iteration_branch = IVLCmd::seqs(&iteration_cmds);
+
+            let exit_branch = IVLCmd::assume(&not(&guard));
+
+            cmds.push(IVLCmd::nondets(&[
+                iteration_branch,
+                exit_branch,
+            ]));
+
             Ok(IVLCmd::seqs(&cmds))
         }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
@@ -214,16 +343,53 @@ fn collect_modified(cmd: &Cmd, out: &mut Vec<(Name, Type)>) {
                 out.push((name.clone(), expr.ty.clone()));
             }
         }
+
+        CmdKind::VarDefinition { name, ty, .. } => {
+            if !out.iter().any(|(n, _)| n.ident == name.ident) {
+                out.push((name.clone(), ty.clone()));
+            }
+        }
+
         CmdKind::Seq(a, b) => {
             collect_modified(a, out);
             collect_modified(b, out);
         }
+
         CmdKind::Match { body } | CmdKind::Loop { body, .. } => {
             for case in &body.cases {
                 collect_modified(&case.cmd, out);
             }
         }
+
+        CmdKind::For { name, body, .. } => {
+            if !out.iter().any(|(n, _)| n.ident == name.ident) {
+                out.push((name.clone(), Type::Int));
+            }
+
+            collect_modified(&body.cmd, out);
+        }
+
         _ => {}
+    }
+}
+
+fn constant_int(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Num(value) => Some(*value),
+
+        ExprKind::Infix(left, Op::Add, right) => {
+            constant_int(left)?.checked_add(constant_int(right)?)
+        }
+
+        ExprKind::Infix(left, Op::Sub, right) => {
+            constant_int(left)?.checked_sub(constant_int(right)?)
+        }
+
+        ExprKind::Infix(left, Op::Mul, right) => {
+            constant_int(left)?.checked_mul(constant_int(right)?)
+        }
+
+        _ => None,
     }
 }
 
@@ -255,12 +421,42 @@ fn substitute(post: &Expr, name: &Name, value: &Expr) -> Expr {
 
             result
         }
+        ExprKind::Quantifier(quantifier, vars, inner) => {
+            if vars.iter().any(|v| v.name.ident == name.ident) {
+                return post.clone();
+            }
+
+            let mut result = post.clone();
+
+            result.kind = ExprKind::Quantifier(
+                quantifier.clone(),
+                vars.clone(),
+                Box::new(substitute(inner, name, value)),
+            );
+
+            result
+        }
 
         _ => post.clone(),
     }
 }
 
-/*
+fn unroll_for(
+    name: &Name,
+    start: i64,
+    end: i64,
+    body: &Cmd,
+) -> Result<IVLCmd> {
+    let mut cmds = Vec::new();
+
+    for i in start..end {
+        cmds.push(IVLCmd::assign(name, &Expr::num(i)));
+        cmds.push(cmd_to_ivlcmd(body)?);
+    }
+
+    Ok(IVLCmd::seqs(&cmds))
+}
+
 fn forall(name: &Name, ty: &Type, post: &Expr) -> Expr {
     let variable = Var {
         name: name.clone(),
@@ -270,13 +466,17 @@ fn forall(name: &Name, ty: &Type, post: &Expr) -> Expr {
 
     let mut result = post.clone();
 
-    result.kind = ExprKind::Quantifier(Quantifier::Forall, vec![variable], Box::new(post.clone()));
+    result.kind = ExprKind::Quantifier(
+        Quantifier::Forall,
+        vec![variable],
+        Box::new(post.clone()),
+    );
 
     result.ty = Type::Bool;
-
     result
 }
-*/
+
+
 fn div_asserts(expr: &Expr) -> Vec<IVLCmd> {
     let mut out = Vec::new();
     match &expr.kind {
@@ -308,7 +508,21 @@ fn not(expr: &Expr) -> Expr {
 
 fn fresh_ident(base: &str) -> String {
     let n = FRESH_COUNTER.fetch_add(1, Ordering::SeqCst);
-    return format!("{base}_havoc_{n}");
+    return format!("{base}_fresh_{n}");
+}
+
+fn fresh_name(base: &str) -> Name {
+    Name {
+        span: Span::default(),
+        ident: fresh_ident(base),
+    }
+}
+
+fn name_to_expr(name: &Name, ty: Type) -> Expr {
+    let mut expr = Expr::bool(true);
+    expr.kind = ExprKind::Ident(name.ident.clone());
+    expr.ty = ty;
+    expr
 }
 
 /// Compute the weakest precondition of IVL program
@@ -364,10 +578,12 @@ fn wp(
 
         // wp[havoc x](G) = Forall x. G
         IVLCmdKind::Havoc { name, ty } => {
-            let mut fresh = Expr::bool(true);
-            fresh.kind = ExprKind::Ident(fresh_ident(&name.ident));
-            fresh.ty = ty.clone();
-            Ok((substitute(post, name, &fresh), Vec::new()))
+            let fresh = fresh_name(&name.ident);
+            let fresh_expr = name_to_expr(&fresh, ty.clone());
+            let substituted_post = substitute(post, name, &fresh_expr);
+            let pre = forall(&fresh, ty, &substituted_post);
+
+            Ok((pre, Vec::new()))
         }
 
         // wp[C1 [] C2](G) = wp[C1](G) And wp[C2](G)
