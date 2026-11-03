@@ -38,7 +38,8 @@ impl slang_ui::Hook for App {
 
             // get method body, convert to IVL
             let cmd = &m.body.clone().unwrap().cmd;
-            let mut ivl = cmd_to_ivlcmd(cmd)?;
+            let ensures: Vec<Expr> = m.ensures().cloned().collect();
+            let mut ivl = cmd_to_ivlcmd(cmd, &ensures)?;
             for postcondition in m.ensures() {
                 let assertion = IVLCmd::assert(postcondition, "Postcondition might not hold");
 
@@ -93,13 +94,13 @@ impl slang_ui::Hook for App {
 }
 
 /// Encode a Cmd into IVL
-fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
+fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
     match &cmd.kind {
         CmdKind::Assert { condition, message } => Ok(IVLCmd::assert(condition, message)),
         CmdKind::Assume { condition } => Ok(IVLCmd::assume(condition)),
         CmdKind::Seq(first, second) => {
-            let first_ivl = cmd_to_ivlcmd(first)?;
-            let second_ivl = cmd_to_ivlcmd(second)?;
+            let first_ivl = cmd_to_ivlcmd(first, ensures)?;
+            let second_ivl = cmd_to_ivlcmd(second, ensures)?;
 
             Ok(IVLCmd::seq(&first_ivl, &second_ivl))
         }
@@ -129,7 +130,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                     None => case.condition.clone(),
                 };
 
-                let branch = IVLCmd::seq(&IVLCmd::assume(&guard), &cmd_to_ivlcmd(&case.cmd)?);
+                let branch = IVLCmd::seq(&IVLCmd::assume(&guard), &cmd_to_ivlcmd(&case.cmd, ensures)?);
                 branches.push(branch);
 
                 let neg = not(&case.condition);
@@ -141,18 +142,27 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
 
             Ok(IVLCmd::nondets(&branches))
         }
-        CmdKind::Return { expr } => match expr {
-            Some(value) => {
+
+        CmdKind::Return { expr } => {
+            let mut cmds = Vec::new();
+
+            if let Some(value) = expr {
                 let name = Name {
                     span: cmd.span,
                     ident: "result".to_string(),
                 };
-
-                Ok(IVLCmd::assign(&name, value))
+                cmds.extend(div_asserts(value));
+                cmds.push(IVLCmd::assign(&name, value));
             }
 
-            None => Ok(IVLCmd::assume(&Expr::bool(true))),
-        },
+            for post in ensures {
+                cmds.push(IVLCmd::assert(post, "Postcondition might not hold"));
+            }
+
+            // Nothing after a return is executed
+            cmds.push(IVLCmd::assume(&Expr::bool(false)));
+            Ok(IVLCmd::seqs(&cmds))
+        }
 
         CmdKind::Loop {
             invariants,
@@ -182,7 +192,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
 
             for (idx, case) in body.cases.iter().enumerate() {
                 let guard = &case.condition;
-                let mut b = vec![IVLCmd::assume(guard), cmd_to_ivlcmd(&case.cmd)?];
+                let mut b = vec![IVLCmd::assume(guard), cmd_to_ivlcmd(&case.cmd, ensures)?];
 
                 for inv in invariants {
                     b.push(IVLCmd::assert(
@@ -216,7 +226,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             if let (Some(start), Some(end)) = (constant_int(lower_bound), constant_int(upper_bound))
             {
                 if invariants.is_empty() {
-                    return unroll_for(name, start, end, &body.cmd);
+                    return unroll_for(name, start, end, &body.cmd, ensures);
                 }
             }
 
@@ -267,8 +277,8 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             // One iteration: i := lower; body; lower := lower + 1
             let guard = infix(&lower_expr, Op::Lt, &upper_expr, Type::Bool);
             let assign_i = IVLCmd::assign(name, &lower_expr);
-            let encoded_body = cmd_to_ivlcmd(&body.cmd)?;
-            
+            let encoded_body = cmd_to_ivlcmd(&body.cmd, ensures)?;
+
             let increment = infix(&lower_expr, Op::Add, &Expr::num(1), Type::Int);
             let increment_lower = IVLCmd::assign(&lower, &increment);
 
@@ -403,12 +413,12 @@ fn substitute(post: &Expr, name: &Name, value: &Expr) -> Expr {
     }
 }
 
-fn unroll_for(name: &Name, start: i64, end: i64, body: &Cmd) -> Result<IVLCmd> {
+fn unroll_for(name: &Name, start: i64, end: i64, body: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
     let mut cmds = Vec::new();
 
     for i in start..end {
         cmds.push(IVLCmd::assign(name, &Expr::num(i)));
-        cmds.push(cmd_to_ivlcmd(body)?);
+        cmds.push(cmd_to_ivlcmd(body, ensures)?);
     }
 
     Ok(IVLCmd::seqs(&cmds))
