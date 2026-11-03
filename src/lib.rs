@@ -213,67 +213,37 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             let slang::ast::Range::FromTo(lower_bound, upper_bound) = range;
 
             // Bounded For-loops
-            if let (Some(start), Some(end)) = (
-                constant_int(lower_bound),
-                constant_int(upper_bound),
-            ) {
+            if let (Some(start), Some(end)) = (constant_int(lower_bound), constant_int(upper_bound))
+            {
                 if invariants.is_empty() {
                     return unroll_for(name, start, end, &body.cmd);
                 }
             }
 
             // Unbounded For-loops
+            //
+            //   lower := L; upper := U;
+            //   assert I;
+            //   havoc modified; havoc lower;
+            //   assume I;
+            //   (  assume lower < upper;
+            //      i := lower; body; lower := lower + 1;
+            //      assert I; unreachable
+            //   [] assume !(lower < upper) )
             let lower = fresh_name("lower");
             let upper = fresh_name("upper");
-            let initial_lower = fresh_name("initial_lower");
-            
+
             let lower_expr = name_to_expr(&lower, Type::Int);
             let upper_expr = name_to_expr(&upper, Type::Int);
-            let initial_lower_expr = name_to_expr(&initial_lower, Type::Int);
 
             let mut cmds = Vec::new();
-            
             cmds.push(IVLCmd::assign(&lower, lower_bound));
             cmds.push(IVLCmd::assign(&upper, upper_bound));
-            cmds.push(IVLCmd::assign(&initial_lower, &lower_expr));
 
-
-            let guard = infix(&lower_expr, Op::Lt, &upper_expr, Type::Bool);
-
-            let lower_bound_inv = infix(
-                &initial_lower_expr,
-                Op::Le,
-                &lower_expr,
-                Type::Bool,
-            );
-
-            let upper_bound_inv = infix(
-                &infix(
-                    &lower_expr,
-                    Op::Le,
-                    &initial_lower_expr,
-                    Type::Bool,
-                ),
-                Op::Or,
-                &infix(
-                    &lower_expr,
-                    Op::Le,
-                    &upper_expr,
-                    Type::Bool,
-                ),
-                Type::Bool,
-            );
-
-            let mut loop_invariants = vec![
-                lower_bound_inv,
-                upper_bound_inv,
-            ];
-
-            loop_invariants.extend(
-                invariants
-                    .iter()
-                    .map(|inv| substitute(inv, name, &lower_expr)),
-            );
+            let loop_invariants: Vec<Expr> = invariants
+                .iter()
+                .map(|inv| substitute(inv, name, &lower_expr))
+                .collect();
 
             for inv in &loop_invariants {
                 cmds.push(IVLCmd::assert(
@@ -282,28 +252,25 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 ));
             }
 
+            // Havoc loop targets, and the counter
             let mut modified = Vec::new();
             collect_modified(&body.cmd, &mut modified);
-
             for (modified_name, ty) in &modified {
                 cmds.push(IVLCmd::havoc(modified_name, ty));
             }
-
             cmds.push(IVLCmd::havoc(&lower, &Type::Int));
 
             for inv in &loop_invariants {
                 cmds.push(IVLCmd::assume(inv));
             }
 
+            // One iteration: i := lower; body; lower := lower + 1
+            let guard = infix(&lower_expr, Op::Lt, &upper_expr, Type::Bool);
             let assign_i = IVLCmd::assign(name, &lower_expr);
-
             let encoded_body = cmd_to_ivlcmd(&body.cmd)?;
-
+            
             let increment = infix(&lower_expr, Op::Add, &Expr::num(1), Type::Int);
-
             let increment_lower = IVLCmd::assign(&lower, &increment);
-
-
 
             let mut iteration_cmds = vec![
                 IVLCmd::assume(&guard),
@@ -318,17 +285,12 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                     "For-loop invariant might not be preserved",
                 ));
             }
-
             iteration_cmds.push(IVLCmd::unreachable());
 
             let iteration_branch = IVLCmd::seqs(&iteration_cmds);
-
             let exit_branch = IVLCmd::assume(&not(&guard));
 
-            cmds.push(IVLCmd::nondets(&[
-                iteration_branch,
-                exit_branch,
-            ]));
+            cmds.push(IVLCmd::nondets(&[iteration_branch, exit_branch]));
 
             Ok(IVLCmd::seqs(&cmds))
         }
@@ -441,12 +403,7 @@ fn substitute(post: &Expr, name: &Name, value: &Expr) -> Expr {
     }
 }
 
-fn unroll_for(
-    name: &Name,
-    start: i64,
-    end: i64,
-    body: &Cmd,
-) -> Result<IVLCmd> {
+fn unroll_for(name: &Name, start: i64, end: i64, body: &Cmd) -> Result<IVLCmd> {
     let mut cmds = Vec::new();
 
     for i in start..end {
@@ -466,16 +423,11 @@ fn forall(name: &Name, ty: &Type, post: &Expr) -> Expr {
 
     let mut result = post.clone();
 
-    result.kind = ExprKind::Quantifier(
-        Quantifier::Forall,
-        vec![variable],
-        Box::new(post.clone()),
-    );
+    result.kind = ExprKind::Quantifier(Quantifier::Forall, vec![variable], Box::new(post.clone()));
 
     result.ty = Type::Bool;
     result
 }
-
 
 fn div_asserts(expr: &Expr) -> Vec<IVLCmd> {
     let mut out = Vec::new();
