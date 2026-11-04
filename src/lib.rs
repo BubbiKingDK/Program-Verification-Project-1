@@ -130,7 +130,8 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
                     None => case.condition.clone(),
                 };
 
-                let branch = IVLCmd::seq(&IVLCmd::assume(&guard), &cmd_to_ivlcmd(&case.cmd, ensures)?);
+                let branch =
+                    IVLCmd::seq(&IVLCmd::assume(&guard), &cmd_to_ivlcmd(&case.cmd, ensures)?);
                 branches.push(branch);
 
                 let neg = not(&case.condition);
@@ -192,7 +193,20 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
 
             for (idx, case) in body.cases.iter().enumerate() {
                 let guard = &case.condition;
-                let mut b = vec![IVLCmd::assume(guard), cmd_to_ivlcmd(&case.cmd, ensures)?];
+                let mut b = vec![IVLCmd::assume(guard)];
+                
+                let mut old_v: Option<Expr> = None;
+                
+                if let Some(expr) = variant {
+                    let old = fresh_name("variant");
+                    let old_expr = name_to_expr(&old, Type::Int);
+
+                    b.push(IVLCmd::assign(&old, expr));
+                    b.push(IVLCmd::assert(&infix(expr, Op::Ge, &Expr::num(0), Type::Int), "Loop variant might not be non-negative"));
+                    old_v = Some(old_expr);
+                }
+                
+                b.push(cmd_to_ivlcmd(&case.cmd, ensures)?);
 
                 for inv in invariants {
                     b.push(IVLCmd::assert(
@@ -200,6 +214,12 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
                         &format!("Loop invariant might not be preserved in case {}", idx + 1),
                     ));
                 }
+
+                if let (Some(expr), Some(old_expr)) = (variant, old_v) {
+                    b.push(IVLCmd::assert(&infix(expr, Op::Lt, &old_expr, Type::Int), "Loop variant might not decrease"));
+                    old_v = Some(old_expr);
+                }
+
                 b.push(IVLCmd::unreachable());
                 branches.push(IVLCmd::seqs(&b));
 
