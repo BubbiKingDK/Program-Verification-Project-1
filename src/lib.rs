@@ -38,7 +38,8 @@ impl slang_ui::Hook for App {
 
         let sigs: HashMap<String, Contract> = file
             .methods()
-            .into_iter().map(|m| {
+            .into_iter()
+            .map(|m| {
                 (
                     m.name.ident.clone(),
                     Contract {
@@ -152,8 +153,10 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr], sigs: &HashMap<String, Contract>) 
                     None => case.condition.clone(),
                 };
 
-                let branch =
-                    IVLCmd::seq(&IVLCmd::assume(&guard), &cmd_to_ivlcmd(&case.cmd, ensures, sigs)?);
+                let branch = IVLCmd::seq(
+                    &IVLCmd::assume(&guard),
+                    &cmd_to_ivlcmd(&case.cmd, ensures, sigs)?,
+                );
                 branches.push(branch);
 
                 let neg = not(&case.condition);
@@ -161,6 +164,16 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr], sigs: &HashMap<String, Contract>) 
                     Some(prev) => infix(&prev, Op::And, &neg, Type::Bool),
                     None => neg,
                 });
+            }
+
+            let has_unconditional_branch = body
+                .cases
+                .iter()
+                .any(|case| matches!(&case.condition.kind, ExprKind::Bool(true)));
+
+            if !has_unconditional_branch {
+                let fallback = earlier_failed.unwrap_or(Expr::bool(true));
+                branches.push(IVLCmd::assume(&fallback));
             }
 
             Ok(IVLCmd::nondets(&branches))
@@ -506,7 +519,14 @@ fn substitute(post: &Expr, name: &Name, value: &Expr) -> Expr {
     }
 }
 
-fn unroll_for(name: &Name, start: i64, end: i64, body: &Cmd, ensures: &[Expr], sigs: &HashMap<String, Contract>) -> Result<IVLCmd> {
+fn unroll_for(
+    name: &Name,
+    start: i64,
+    end: i64,
+    body: &Cmd,
+    ensures: &[Expr],
+    sigs: &HashMap<String, Contract>,
+) -> Result<IVLCmd> {
     let mut cmds = Vec::new();
 
     for i in start..end {
