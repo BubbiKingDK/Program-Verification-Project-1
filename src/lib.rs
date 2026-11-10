@@ -23,12 +23,20 @@ struct VerificationCondition {
     message: String,
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct Contract {
     params: Vec<Name>,
     requires: Vec<Expr>,
     ensures: Vec<Expr>,
+    ret_ty: Option<Type>,
+    variant: Option<Expr>,
+    callees: HashSet<String>,
+}
+
+struct Env<'a> {
+    contracts: &'a HashMap<String, Contract>,
+    current: &'a str,
 }
 
 impl slang_ui::Hook for App {
@@ -46,6 +54,15 @@ impl slang_ui::Hook for App {
                         params: m.args.iter().map(|v| v.name.clone()).collect(),
                         requires: m.requires().cloned().collect(),
                         ensures: m.ensures().cloned().collect(),
+                        ret_ty: m.return_ty.clone(),
+                        variant: m.variant.clone(),
+                        callees: {
+                            let mut set = HashSet::new();
+                            if let Some(b) = &m.body {
+                                collect_calls(&b.cmd, &mut set);
+                            }
+                            set
+                        },
                     },
                 )
             })
@@ -62,7 +79,8 @@ impl slang_ui::Hook for App {
             // get method body, convert to IVL
             let cmd = &m.body.clone().unwrap().cmd;
             let ensures: Vec<Expr> = m.ensures().cloned().collect();
-            let mut ivl = cmd_to_ivlcmd(cmd, &ensures, &sigs)?;
+            let env = Env { contracts: &sigs, current: &m.name.ident };
+            let mut ivl = cmd_to_ivlcmd(cmd, &ensures, &env)?;
             for postcondition in m.ensures() {
                 let assertion = IVLCmd::assert(postcondition, "Postcondition might not hold");
 
@@ -117,7 +135,7 @@ impl slang_ui::Hook for App {
 }
 
 /// Encode a Cmd into IVL
-fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr], sigs: &HashMap<String, Contract>) -> Result<IVLCmd> {
+fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr], sigs: &Env) -> Result<IVLCmd> {
     match &cmd.kind {
         CmdKind::Assert { condition, message } => Ok(IVLCmd::assert(condition, message)),
         CmdKind::Assume { condition } => Ok(IVLCmd::assume(condition)),
@@ -365,32 +383,58 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr], sigs: &HashMap<String, Contract>) 
 
             Ok(IVLCmd::seqs(&cmds))
         }
-        CmdKind::MethodCall {
-            name,
-            fun_name,
-            args,
-            ..
-        } => {
-            let Some(c) = sigs.get(&fun_name.ident) else {
+                CmdKind::MethodCall { name, fun_name, args, .. } => {
+            let Some(c) = sigs.contracts.get(&fun_name.ident) else {
                 bail!("unknown method {}", fun_name.ident);
             };
 
+            // simultaneous substitution of parameters by arguments
             let rename = |e: &Expr| {
-                c.params
+                let fresh: Vec<Name> =
+                    c.params.iter().map(|p| fresh_name(&p.ident)).collect();
+                let step1 = c.params.iter().zip(&fresh).zip(args).fold(
+                    e.clone(),
+                    |acc, ((p, f), a)| substitute(&acc, p, &name_to_expr(f, a.ty.clone())),
+                );
+                fresh
                     .iter()
                     .zip(args)
-                    .fold(e.clone(), |acc, (p, a)| substitute(&acc, p, a))
+                    .fold(step1, |acc, (f, a)| substitute(&acc, f, a))
             };
 
             let mut cmds = Vec::new();
 
+            // preconditions: error must point at the CALL, not at the `requires` line
             for pre in &c.requires {
-                cmds.push(IVLCmd::assert(&rename(pre), "Precondition might not hold"));
+                let mut cond = rename(pre);
+                cond.span = cmd.span;
+                cmds.push(IVLCmd::assert(&cond, "Precondition might not hold"));
             }
 
+            // Ext 7: variant must be >= 0 and strictly smaller for recursive calls
+            let cur = &sigs.contracts[sigs.current];
+            if let (Some(cur_var), Some(callee_var)) = (&cur.variant, &c.variant) {
+                if reaches(sigs.contracts, &fun_name.ident, sigs.current) {
+                    let next = rename(callee_var);
+
+                    let mut nonneg = infix(&next, Op::Ge, &Expr::num(0), Type::Bool);
+                    nonneg.span = cmd.span;
+                    cmds.push(IVLCmd::assert(
+                        &nonneg,
+                        "Method variant might not be non-negative",
+                    ));
+
+                    let mut dec = infix(&next, Op::Lt, cur_var, Type::Bool);
+                    dec.span = cmd.span;
+                    cmds.push(IVLCmd::assert(&dec, "Method variant might not decrease"));
+                }
+            }
+
+            // result: use the callee's real return type (Bool methods exist)
+            let ret_ty = c.ret_ty.clone().unwrap_or(Type::Int);
             let ret = fresh_name("ret");
-            let ret_expr = name_to_expr(&ret, Type::Int);
-            cmds.push(IVLCmd::havoc(&ret, &Type::Int));
+            let ret_expr = name_to_expr(&ret, ret_ty.clone());
+            cmds.push(IVLCmd::havoc(&ret, &ret_ty));
 
             let result_name = Name {
                 span: cmd.span,
@@ -449,6 +493,42 @@ fn collect_modified(cmd: &Cmd, out: &mut Vec<(Name, Type)>) {
 
         _ => {}
     }
+}
+
+fn collect_calls(cmd: &Cmd, out: &mut HashSet<String>) {
+    match &cmd.kind {
+        CmdKind::MethodCall { fun_name, .. } => {
+            out.insert(fun_name.ident.clone());
+        }
+        CmdKind::Seq(a, b) => {
+            collect_calls(a, out);
+            collect_calls(b, out);
+        }
+        CmdKind::Match { body } | CmdKind::Loop { body, .. } => {
+            for case in &body.cases {
+                collect_calls(&case.cmd, out);
+            }
+        }
+        CmdKind::For { body, .. } => collect_calls(&body.cmd, out),
+        _ => {}
+    }
+}
+
+fn reaches(contracts: &HashMap<String, Contract>, from: &str, to: &str) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![from.to_string()];
+    while let Some(m) = stack.pop() {
+        if m == to {
+            return true;
+        }
+        if !seen.insert(m.clone()) {
+            continue;
+        }
+        if let Some(c) = contracts.get(&m) {
+            stack.extend(c.callees.iter().cloned());
+        }
+    }
+    false
 }
 
 fn constant_int(expr: &Expr) -> Option<i64> {
@@ -525,7 +605,7 @@ fn unroll_for(
     end: i64,
     body: &Cmd,
     ensures: &[Expr],
-    sigs: &HashMap<String, Contract>,
+    sigs: &Env,
 ) -> Result<IVLCmd> {
     let mut cmds = Vec::new();
 
@@ -655,8 +735,7 @@ fn wp(
         IVLCmdKind::Havoc { name, ty } => {
             let fresh = fresh_name(&name.ident);
             let fresh_expr = name_to_expr(&fresh, ty.clone());
-            let substituted_post = substitute(post, name, &fresh_expr);
-            let pre = forall(&fresh, ty, &substituted_post);
+            let pre = substitute(post, name, &fresh_expr);
 
             Ok((pre, Vec::new()))
         }
