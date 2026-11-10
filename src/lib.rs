@@ -23,10 +23,32 @@ struct VerificationCondition {
     message: String,
 }
 
+use std::collections::HashMap;
+
+struct Contract {
+    params: Vec<Name>,
+    requires: Vec<Expr>,
+    ensures: Vec<Expr>,
+}
+
 impl slang_ui::Hook for App {
     fn analyze(&self, cx: &slang_ui::Context, file: &slang::SourceFile) -> Result<()> {
         // get reference to z3 solver
         let mut solver = cx.solver()?;
+
+        let sigs: HashMap<String, Contract> = file
+            .methods()
+            .into_iter().map(|m| {
+                (
+                    m.name.ident.clone(),
+                    Contract {
+                        params: m.args.iter().map(|v| v.name.clone()).collect(),
+                        requires: m.requires().cloned().collect(),
+                        ensures: m.ensures().cloned().collect(),
+                    },
+                )
+            })
+            .collect();
 
         // iterate all methods
         for m in file.methods() {
@@ -39,7 +61,7 @@ impl slang_ui::Hook for App {
             // get method body, convert to IVL
             let cmd = &m.body.clone().unwrap().cmd;
             let ensures: Vec<Expr> = m.ensures().cloned().collect();
-            let mut ivl = cmd_to_ivlcmd(cmd, &ensures)?;
+            let mut ivl = cmd_to_ivlcmd(cmd, &ensures, &sigs)?;
             for postcondition in m.ensures() {
                 let assertion = IVLCmd::assert(postcondition, "Postcondition might not hold");
 
@@ -94,13 +116,13 @@ impl slang_ui::Hook for App {
 }
 
 /// Encode a Cmd into IVL
-fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
+fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr], sigs: &HashMap<String, Contract>) -> Result<IVLCmd> {
     match &cmd.kind {
         CmdKind::Assert { condition, message } => Ok(IVLCmd::assert(condition, message)),
         CmdKind::Assume { condition } => Ok(IVLCmd::assume(condition)),
         CmdKind::Seq(first, second) => {
-            let first_ivl = cmd_to_ivlcmd(first, ensures)?;
-            let second_ivl = cmd_to_ivlcmd(second, ensures)?;
+            let first_ivl = cmd_to_ivlcmd(first, ensures, sigs)?;
+            let second_ivl = cmd_to_ivlcmd(second, ensures, sigs)?;
 
             Ok(IVLCmd::seq(&first_ivl, &second_ivl))
         }
@@ -131,7 +153,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
                 };
 
                 let branch =
-                    IVLCmd::seq(&IVLCmd::assume(&guard), &cmd_to_ivlcmd(&case.cmd, ensures)?);
+                    IVLCmd::seq(&IVLCmd::assume(&guard), &cmd_to_ivlcmd(&case.cmd, ensures, sigs)?);
                 branches.push(branch);
 
                 let neg = not(&case.condition);
@@ -194,19 +216,22 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
             for (idx, case) in body.cases.iter().enumerate() {
                 let guard = &case.condition;
                 let mut b = vec![IVLCmd::assume(guard)];
-                
+
                 let mut old_v: Option<Expr> = None;
-                
+
                 if let Some(expr) = variant {
                     let old = fresh_name("variant");
                     let old_expr = name_to_expr(&old, Type::Int);
 
                     b.push(IVLCmd::assign(&old, expr));
-                    b.push(IVLCmd::assert(&infix(expr, Op::Ge, &Expr::num(0), Type::Int), "Loop variant might not be non-negative"));
+                    b.push(IVLCmd::assert(
+                        &infix(expr, Op::Ge, &Expr::num(0), Type::Int),
+                        "Loop variant might not be non-negative",
+                    ));
                     old_v = Some(old_expr);
                 }
-                
-                b.push(cmd_to_ivlcmd(&case.cmd, ensures)?);
+
+                b.push(cmd_to_ivlcmd(&case.cmd, ensures, sigs)?);
 
                 for inv in invariants {
                     b.push(IVLCmd::assert(
@@ -216,7 +241,10 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
                 }
 
                 if let (Some(expr), Some(old_expr)) = (variant, old_v) {
-                    b.push(IVLCmd::assert(&infix(expr, Op::Lt, &old_expr, Type::Int), "Loop variant might not decrease"));
+                    b.push(IVLCmd::assert(
+                        &infix(expr, Op::Lt, &old_expr, Type::Int),
+                        "Loop variant might not decrease",
+                    ));
                     old_v = Some(old_expr);
                 }
 
@@ -246,7 +274,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
             if let (Some(start), Some(end)) = (constant_int(lower_bound), constant_int(upper_bound))
             {
                 if invariants.is_empty() {
-                    return unroll_for(name, start, end, &body.cmd, ensures);
+                    return unroll_for(name, start, end, &body.cmd, ensures, sigs);
                 }
             }
 
@@ -297,7 +325,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
             // One iteration: i := lower; body; lower := lower + 1
             let guard = infix(&lower_expr, Op::Lt, &upper_expr, Type::Bool);
             let assign_i = IVLCmd::assign(name, &lower_expr);
-            let encoded_body = cmd_to_ivlcmd(&body.cmd, ensures)?;
+            let encoded_body = cmd_to_ivlcmd(&body.cmd, ensures, sigs)?;
 
             let increment = infix(&lower_expr, Op::Add, &Expr::num(1), Type::Int);
             let increment_lower = IVLCmd::assign(&lower, &increment);
@@ -321,6 +349,51 @@ fn cmd_to_ivlcmd(cmd: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
             let exit_branch = IVLCmd::assume(&not(&guard));
 
             cmds.push(IVLCmd::nondets(&[iteration_branch, exit_branch]));
+
+            Ok(IVLCmd::seqs(&cmds))
+        }
+        CmdKind::MethodCall {
+            name,
+            fun_name,
+            args,
+            ..
+        } => {
+            let Some(c) = sigs.get(&fun_name.ident) else {
+                bail!("unknown method {}", fun_name.ident);
+            };
+
+            let rename = |e: &Expr| {
+                c.params
+                    .iter()
+                    .zip(args)
+                    .fold(e.clone(), |acc, (p, a)| substitute(&acc, p, a))
+            };
+
+            let mut cmds = Vec::new();
+
+            for pre in &c.requires {
+                cmds.push(IVLCmd::assert(&rename(pre), "Precondition might not hold"));
+            }
+
+            let ret = fresh_name("ret");
+            let ret_expr = name_to_expr(&ret, Type::Int);
+            cmds.push(IVLCmd::havoc(&ret, &Type::Int));
+
+            let result_name = Name {
+                span: cmd.span,
+                ident: "result".to_string(),
+            };
+            for post in &c.ensures {
+                cmds.push(IVLCmd::assume(&substitute(
+                    &rename(post),
+                    &result_name,
+                    &ret_expr,
+                )));
+            }
+
+            if let Some(x) = name {
+                cmds.push(IVLCmd::assign(x, &ret_expr));
+            }
 
             Ok(IVLCmd::seqs(&cmds))
         }
@@ -433,12 +506,12 @@ fn substitute(post: &Expr, name: &Name, value: &Expr) -> Expr {
     }
 }
 
-fn unroll_for(name: &Name, start: i64, end: i64, body: &Cmd, ensures: &[Expr]) -> Result<IVLCmd> {
+fn unroll_for(name: &Name, start: i64, end: i64, body: &Cmd, ensures: &[Expr], sigs: &HashMap<String, Contract>) -> Result<IVLCmd> {
     let mut cmds = Vec::new();
 
     for i in start..end {
         cmds.push(IVLCmd::assign(name, &Expr::num(i)));
-        cmds.push(cmd_to_ivlcmd(body, ensures)?);
+        cmds.push(cmd_to_ivlcmd(body, ensures, sigs)?);
     }
 
     Ok(IVLCmd::seqs(&cmds))
